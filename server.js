@@ -5,6 +5,9 @@ const mongoose = require('mongoose');
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const cors = require('cors');
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs');
 
 const app = express();
 const server = http.createServer(app);
@@ -17,7 +20,20 @@ const MONGO_URI = process.env.MONGO_URI || 'mongodb+srv://<user>:<pass>@cluster.
 const JWT_SECRET = process.env.JWT_SECRET || 'secretcalc_jwt_secret_change_in_prod';
 const PORT = process.env.PORT || 3000;
 
+// Voice upload dir
+const VOICE_DIR = path.join(__dirname, 'uploads', 'voice');
+if (!fs.existsSync(VOICE_DIR)) fs.mkdirSync(VOICE_DIR, { recursive: true });
+
+const storage = multer.diskStorage({
+  destination: VOICE_DIR,
+  filename: (_, file, cb) => cb(null, `${Date.now()}_${crypto.randomBytes(4).toString('hex')}${path.extname(file.originalname)}`)
+});
+const upload = multer({ storage, limits: { fileSize: 10 * 1024 * 1024 } }); // 10MB max
+
 mongoose.connect(MONGO_URI).then(() => console.log('MongoDB connected')).catch(err => console.error('MongoDB error:', err));
+
+// Serve uploaded voice files
+app.use('/uploads/voice', express.static(VOICE_DIR));
 
 // ─── Schemas ───────────────────────────────────────────────────────────────────
 
@@ -40,6 +56,9 @@ const MessageSchema = new mongoose.Schema({
   roomId: { type: String, required: true, index: true },
   senderId: { type: String, required: true },
   content: { type: String, required: true },
+  type: { type: String, default: 'text' },      // 'text' | 'voice'
+  voiceUrl: { type: String },
+  voiceDuration: { type: Number, default: 0 },
   replyTo: {
     messageId: String,
     content: String,
@@ -68,22 +87,22 @@ function authMiddleware(req, res, next) {
 
 // ─── REST Routes ──────────────────────────────────────────────────────────────
 
+// Health check
+app.get('/health', (_, res) => res.json({ status: 'ok', time: new Date() }));
+
 // Generate pairing code
 app.post('/api/pairing/generate', async (req, res) => {
   try {
     const { deviceId } = req.body;
     if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
 
-    // Remove old pending codes from this device
     await PairingCode.deleteMany({ deviceId, paired: false });
 
     const code = Math.floor(100000 + Math.random() * 900000).toString();
     const roomId = crypto.randomUUID();
-    const expiresAt = new Date(Date.now() + 5 * 60 * 1000); // 5 minutes
+    const expiresAt = new Date(Date.now() + 5 * 60 * 1000);
 
-    const pairing = new PairingCode({ code, deviceId, roomId, expiresAt });
-    await pairing.save();
-
+    await new PairingCode({ code, deviceId, roomId, expiresAt }).save();
     res.json({ code, expiresAt, roomId });
   } catch (err) {
     console.error(err);
@@ -91,7 +110,7 @@ app.post('/api/pairing/generate', async (req, res) => {
   }
 });
 
-// Enter / validate pairing code
+// Enter pairing code
 app.post('/api/pairing/enter', async (req, res) => {
   try {
     const { code, deviceId } = req.body;
@@ -108,16 +127,12 @@ app.post('/api/pairing/enter', async (req, res) => {
     pairing.paired = true;
     await pairing.save();
 
-    // Create room
-    const room = new Room({ roomId: pairing.roomId, devices: [pairing.deviceId, deviceId] });
-    await room.save();
+    await new Room({ roomId: pairing.roomId, devices: [pairing.deviceId, deviceId] }).save();
 
     const token1 = jwt.sign({ deviceId: pairing.deviceId, roomId: pairing.roomId }, JWT_SECRET);
     const token2 = jwt.sign({ deviceId, roomId: pairing.roomId }, JWT_SECRET);
 
-    // Notify the code generator via socket
     io.to(pairing.deviceId).emit('paired', { roomId: pairing.roomId, token: token1 });
-
     res.json({ roomId: pairing.roomId, token: token2 });
   } catch (err) {
     console.error(err);
@@ -125,7 +140,7 @@ app.post('/api/pairing/enter', async (req, res) => {
   }
 });
 
-// Verify token / refresh session
+// Verify token
 app.post('/api/auth/verify', authMiddleware, (req, res) => {
   res.json({ valid: true, roomId: req.user.roomId, deviceId: req.user.deviceId });
 });
@@ -135,7 +150,6 @@ app.get('/api/messages/:roomId', authMiddleware, async (req, res) => {
   try {
     const { roomId } = req.params;
     if (roomId !== req.user.roomId) return res.status(403).json({ error: 'Forbidden' });
-
     const messages = await Message.find({ roomId }).sort({ timestamp: 1 }).limit(500);
     res.json(messages);
   } catch (err) {
@@ -148,13 +162,19 @@ app.delete('/api/messages/:roomId', authMiddleware, async (req, res) => {
   try {
     const { roomId } = req.params;
     if (roomId !== req.user.roomId) return res.status(403).json({ error: 'Forbidden' });
-
     await Message.deleteMany({ roomId });
     io.to(roomId).emit('chat_cleared');
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
   }
+});
+
+// Upload voice note
+app.post('/api/voice/upload', authMiddleware, upload.single('file'), (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+  const url = `${process.env.BASE_URL || `https://yap-xd-server-production.up.railway.app`}/uploads/voice/${req.file.filename}`;
+  res.json({ url });
 });
 
 // Unpair
@@ -173,34 +193,28 @@ app.post('/api/pairing/unpair', authMiddleware, async (req, res) => {
 
 // ─── Socket.io ────────────────────────────────────────────────────────────────
 
-const socketRooms = new Map(); // socketId -> { deviceId, roomId }
+const socketRooms = new Map();
 
 io.on('connection', (socket) => {
   console.log('Socket connected:', socket.id);
 
-  // Register device for pairing notifications
   socket.on('register_device', (deviceId) => {
     socket.join(deviceId);
-    console.log(`Device ${deviceId} registered`);
   });
 
-  // Join chat room after pairing
   socket.on('join_room', ({ roomId, token }) => {
     try {
       const user = jwt.verify(token, JWT_SECRET);
       if (user.roomId !== roomId) return socket.emit('error', 'Invalid room');
-
       socket.join(roomId);
       socketRooms.set(socket.id, { deviceId: user.deviceId, roomId });
       socket.to(roomId).emit('peer_online', { deviceId: user.deviceId });
-      console.log(`${user.deviceId} joined room ${roomId}`);
     } catch {
       socket.emit('error', 'Auth failed');
     }
   });
 
-  // Send message
-  socket.on('send_message', async ({ content, replyTo }, callback) => {
+  socket.on('send_message', async ({ content, type = 'text', voiceUrl, voiceDuration, replyTo }, callback) => {
     const ctx = socketRooms.get(socket.id);
     if (!ctx) return;
 
@@ -209,6 +223,9 @@ io.on('connection', (socket) => {
         roomId: ctx.roomId,
         senderId: ctx.deviceId,
         content,
+        type,
+        voiceUrl: voiceUrl || undefined,
+        voiceDuration: voiceDuration || 0,
         replyTo: replyTo || undefined
       });
       await msg.save();
@@ -218,6 +235,9 @@ io.on('connection', (socket) => {
         roomId: msg.roomId,
         senderId: msg.senderId,
         content: msg.content,
+        type: msg.type,
+        voiceUrl: msg.voiceUrl,
+        voiceDuration: msg.voiceDuration,
         replyTo: msg.replyTo,
         read: msg.read,
         timestamp: msg.timestamp
@@ -231,42 +251,12 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Mark message as read
   socket.on('message_read', async ({ messageId }) => {
     const ctx = socketRooms.get(socket.id);
     if (!ctx) return;
-
     await Message.updateOne({ _id: messageId }, { read: true });
     socket.to(ctx.roomId).emit('message_read', { messageId });
   });
-
-  // ── WebRTC Signaling ────────────────────────────────────────────────────────
-
-  socket.on('call_offer', ({ offer, targetRoom }) => {
-    const ctx = socketRooms.get(socket.id);
-    if (!ctx) return;
-    socket.to(ctx.roomId).emit('call_offer', { offer, fromDevice: ctx.deviceId });
-  });
-
-  socket.on('call_answer', ({ answer }) => {
-    const ctx = socketRooms.get(socket.id);
-    if (!ctx) return;
-    socket.to(ctx.roomId).emit('call_answer', { answer });
-  });
-
-  socket.on('ice_candidate', ({ candidate }) => {
-    const ctx = socketRooms.get(socket.id);
-    if (!ctx) return;
-    socket.to(ctx.roomId).emit('ice_candidate', { candidate });
-  });
-
-  socket.on('call_end', () => {
-    const ctx = socketRooms.get(socket.id);
-    if (!ctx) return;
-    socket.to(ctx.roomId).emit('call_ended');
-  });
-
-  // ── Disconnect ──────────────────────────────────────────────────────────────
 
   socket.on('disconnect', () => {
     const ctx = socketRooms.get(socket.id);
@@ -274,12 +264,7 @@ io.on('connection', (socket) => {
       socket.to(ctx.roomId).emit('peer_offline', { deviceId: ctx.deviceId });
       socketRooms.delete(socket.id);
     }
-    console.log('Socket disconnected:', socket.id);
   });
 });
-
-// ─── Health check ──────────────────────────────────────────────────────────────
-
-app.get('/health', (_, res) => res.json({ status: 'ok', time: new Date() }));
 
 server.listen(PORT, () => console.log(`SecretCalc server running on port ${PORT}`));
